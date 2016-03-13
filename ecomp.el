@@ -32,7 +32,7 @@
 
     ;; mov REG, INT32
     (`(mov ,(and dst (pred ec-register-p)) ,(and src (pred integerp)))
-     `((+ #b10111000 (ec-register-val dst))
+     `(,(+ #b10111000 (ec-register-val dst))
        ,@(ec-u32 src)))
 
     ;; mov REG, REG
@@ -49,7 +49,7 @@
     (`(mov (,(and dst (pred ec-register-p))) ,(and src (pred ec-register-p)))
      (list #b10001001
            (logior #b00000000 (lsh (ec-register-val src) 3) (ec-register-val dst))))
-    
+
     ;; nop
     ((or `nop `(nop))
      (list #x90))
@@ -69,7 +69,7 @@
     ;; dec [REG]
     (`(dec  (,(and reg (pred ec-register-p))))
      (list #xff (+ #x08 (ec-register-val reg))))
-    
+
     ;; push REG
     (`(push  ,(and reg (pred ec-register-p)))
      (list (+ #x50 (ec-register-val reg))))
@@ -154,7 +154,7 @@
          (sec-align  #x1000)
          (file-align #x200)
 
-         
+
          (headers-size (+ pe-offset pe-hdr-size (* nb-sections sec-hdr-size)))
 
          (text-rva (ec-align-to headers-size sec-align))
