@@ -425,8 +425,28 @@
                         (if (and (not (zerop i)) (zerop (mod i 8))) " " "")
                         res))
       (setq n (lsh n -4))
-      (incf i 4))    
+      (incf i 4))
     res))
+
+(defun ec-nasm (src)
+  (let* ((bin-file "/tmp/nasm-src-tmp")
+	 (src-file (concat bin-file ".asm")))
+    (with-temp-file src-file
+      (insert src))
+    (shell-command-to-string (concat "rm -f " bin-file " && nasm -o " bin-file " " src-file))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (let ((coding-system-for-read 'raw-text-unix))
+	(insert-file-contents bin-file))
+      ;; convert to buffer string to list. this seems needlessly complex but oh well...
+      (let (r)
+	(mapc (lambda (c) (push c r)) (buffer-string))
+	(nreverse r)))))
+
+(defun ec-ndisasm (bin)
+  (let* ((bin-file "/tmp/nasm-src-tmp"))
+    (ec-write-bin bin-file bin)
+    (shell-command-to-string (concat "ndisasm -b 32 " bin-file))))
 
 (defvar ec-dos-prog
   (list #x8c #xc8                  ;  mov    %cs,%ax
