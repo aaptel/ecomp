@@ -1,6 +1,8 @@
 ;; tiny 32bit PE assembler (windows) -- aurelien.aptel@gmail.com
 ;; -*- indent-tabs-mode: nil -*-
 
+;; TODO: 2-pass encode (e.g. label after jmp)
+
 (require 'pcase)
 (require 'cl)
 
@@ -12,88 +14,122 @@
 (defun ec-register-val (r)
   (position r ec-registers))
 
-(defun ec-encode (inst)
-  (pcase inst
-    ;; add REG, INT32
-    (`(add ,(and dst (pred ec-register-p)) ,(and src (pred integerp)))
-     `(#b10000001
-       ,(+ #b11000000 (ec-register-val dst))
-       ,@(ec-u32 src)))
+(defun ec-strip-label (sym)
+  (let ((s (symbol-name sym)))
+    (and (string-match (rx bos (group (+ any)) ":" eos) s) (intern (match-string 1 s)))))
 
-    ;; add REG, REG
-    (`(add ,(and dst (pred ec-register-p)) ,(and src (pred ec-register-p)))
-     (list #b00000001
-           (logior #b11000000 (lsh (ec-register-val src) 3) (ec-register-val dst))))
+(defun ec-label-p (sym)
+  (and (symbolp sym) (string-match-p (rx ":" eos) (symbol-name sym))))
 
-    ;; add REG, [REG]
-    (`(add ,(and dst (pred ec-register-p)) ( ,(and src (pred ec-register-p)) ))
-     (list #b00000011
-           (logior #b00000000 (lsh (ec-register-val dst) 3) (ec-register-val src))))
+(defun ec-existing-label-p (map sym)
+  (gethash sym map))
 
-    ;; mov REG, INT32
-    (`(mov ,(and dst (pred ec-register-p)) ,(and src (pred integerp)))
-     `(,(+ #b10111000 (ec-register-val dst))
-       ,@(ec-u32 src)))
+(defun ec-encode (program)
+  (let ((offset 0)
+        (label-map (make-hash-table))
+        (output nil))
+    (dolist (inst program output)
+      (let ((res
+             (pcase inst
+               ;; label:
+               ((and sym (pred ec-label-p))
+                (puthash (ec-strip-label sym) offset label-map) nil)
 
-    ;; mov REG, REG
-    (`(mov ,(and dst (pred ec-register-p)) ,(and src (pred ec-register-p)))
-     (list #b10001001
-           (logior #b11000000 (lsh (ec-register-val src) 3) (ec-register-val dst))))
+               ;; jmp label
+               (`(jmp ,(and label (pred (ec-existing-label-p label-map))))
+                `(#xe9 ,@(ec-s16 (- (gethash label label-map) (+ offset 3)))))
 
-    ;; mov REG, [REG]
-    (`(mov ,(and dst (pred ec-register-p)) (,(and src (pred ec-register-p))))
-     (list #b10001011
-           (logior #b00000000 (lsh (ec-register-val dst) 3) (ec-register-val src))))
+               ;; jmp REG
+               (`(jmp ,(and dst (pred ec-register-p)))
+                `(102 255 ,(+ 224 (ec-register-val dst))))
 
-    ;; mov [REG], REG
-    (`(mov (,(and dst (pred ec-register-p))) ,(and src (pred ec-register-p)))
-     (list #b10001001
-           (logior #b00000000 (lsh (ec-register-val src) 3) (ec-register-val dst))))
+               ;; add REG, INT32
+               (`(add ,(and dst (pred ec-register-p)) ,(and src (pred integerp)))
+                `(#b10000001
+                  ,(+ #b11000000 (ec-register-val dst))
+                  ,@(ec-u32 src)))
 
-    ;; nop
-    ((or `nop `(nop))
-     (list #x90))
+               ;; add REG, REG
+               (`(add ,(and dst (pred ec-register-p)) ,(and src (pred ec-register-p)))
+                (list #b00000001
+                      (logior #b11000000 (lsh (ec-register-val src) 3) (ec-register-val dst))))
 
-    ;; inc REG
-    (`(inc  ,(and reg (pred ec-register-p)))
-     (list (+ #b01000000 (ec-register-val reg))))
+               ;; add REG, [REG]
+               (`(add ,(and dst (pred ec-register-p)) ( ,(and src (pred ec-register-p)) ))
+                (list #b00000011
+                      (logior #b00000000 (lsh (ec-register-val dst) 3) (ec-register-val src))))
 
-    ;; inc [REG]
-    (`(inc  (,(and reg (pred ec-register-p))))
-     (list #xff (ec-register-val reg)))
+               ;; mov REG, INT32
+               (`(mov ,(and dst (pred ec-register-p)) ,(and src (pred integerp)))
+                `(,(+ #b10111000 (ec-register-val dst))
+                  ,@(ec-u32 src)))
 
-    ;; dec REG
-    (`(dec  ,(and reg (pred ec-register-p)))
-     (list (+ #x48 (ec-register-val reg))))
+               ;; mov REG, REG
+               (`(mov ,(and dst (pred ec-register-p)) ,(and src (pred ec-register-p)))
+                (list #b10001001
+                      (logior #b11000000 (lsh (ec-register-val src) 3) (ec-register-val dst))))
 
-    ;; dec [REG]
-    (`(dec  (,(and reg (pred ec-register-p))))
-     (list #xff (+ #x08 (ec-register-val reg))))
+               ;; mov REG, [REG]
+               (`(mov ,(and dst (pred ec-register-p)) (,(and src (pred ec-register-p))))
+                (list #b10001011
+                      (logior #b00000000 (lsh (ec-register-val dst) 3) (ec-register-val src))))
 
-    ;; push REG
-    (`(push  ,(and reg (pred ec-register-p)))
-     (list (+ #x50 (ec-register-val reg))))
+               ;; mov [REG], REG
+               (`(mov (,(and dst (pred ec-register-p))) ,(and src (pred ec-register-p)))
+                (list #b10001001
+                      (logior #b00000000 (lsh (ec-register-val src) 3) (ec-register-val dst))))
 
-    ;; push [REG]
-    (`(push  (,(and reg (pred ec-register-p))))
-     (list #xff (+ #x30 (ec-register-val reg))))
+               ;; nop
+               ((or `nop `(nop))
+                (list #x90))
 
-    ;; pop REG
-    (`(pop  ,(and reg (pred ec-register-p)))
-     (list (+ #x58 (ec-register-val reg))))
+               ;; inc REG
+               (`(inc  ,(and reg (pred ec-register-p)))
+                (list (+ #b01000000 (ec-register-val reg))))
 
-    ;; pop [REG]
-    (`(pop  (,(and reg (pred ec-register-p))))
-     (list #x8f (ec-register-val reg)))
+               ;; inc [REG]
+               (`(inc  (,(and reg (pred ec-register-p))))
+                (list #xff (ec-register-val reg)))
 
-    (_
-     (error "unhandled instruction %S" inst))))
+               ;; dec REG
+               (`(dec  ,(and reg (pred ec-register-p)))
+                (list (+ #x48 (ec-register-val reg))))
+
+               ;; dec [REG]
+               (`(dec  (,(and reg (pred ec-register-p))))
+                (list #xff (+ #x08 (ec-register-val reg))))
+
+               ;; push REG
+               (`(push  ,(and reg (pred ec-register-p)))
+                (list (+ #x50 (ec-register-val reg))))
+
+               ;; push [REG]
+               (`(push  (,(and reg (pred ec-register-p))))
+                (list #xff (+ #x30 (ec-register-val reg))))
+
+               ;; pop REG
+               (`(pop  ,(and reg (pred ec-register-p)))
+                (list (+ #x58 (ec-register-val reg))))
+
+               ;; pop [REG]
+               (`(pop  (,(and reg (pred ec-register-p))))
+                (list #x8f (ec-register-val reg)))
+
+               (_
+                (error "unhandled instruction %S" inst)))))
+        (setq offset (+ offset (length res)))
+        (setq output (append output res))
+        ))))
+
 
 (defun ec-align-to (value align)
   (let ((r (mod value align)))
     (if (= r 0)
         value
       (+ value (- align r)))))
+
+(defun ec-s8-to-u8 (v)
+  (logand 255 v))
 
 (defun ec-u8 (v)
   "Return V as a 8 bit list of 1 byte"
@@ -114,6 +150,36 @@
         (lo (truncate (mod v #x10000))))
     (list (logand lo #xff) (lsh (logand lo #xff00) -8)
           (logand hi #xff) (lsh (logand hi #xff00) -8))))
+
+(defun ec-s32 (v)
+  "Return V as a 32 bit little-endian list of bytes"
+  (cond
+   ((and (>= v 0) (< v (expt 2.0 31.0)))
+    (ec-u32 v))
+   ((and (>= v (expt -2.0 31.0)) (< v 0))
+    (let ((not (mapcar 'ec-s8-to-u8 (mapcar 'lognot (ec-u32 (abs v))))))
+      (cond
+       ((< (elt not 0) 255) (incf (elt not 0)))
+       ((and (setf (elt not 0) 0) (< (elt not 1) 255)) (incf (elt not 1)))
+       ((and (setf (elt not 1) 0) (< (elt not 2) 255)) (incf (elt not 2)))
+       ((and (setf (elt not 2) 0) (< (elt not 3) 255)) (incf (elt not 3)))
+       (t (setf (elt not 3) 0)))
+      not))
+   (t (error "invalid value"))))
+
+(defun ec-s16 (v)
+  "Return V as a 16 bit little-endian list of bytes"
+  (cond
+   ((and (>= v 0) (< v (expt 2.0 15.0)))
+    (ec-u16 v))
+   ((and (>= v (expt -2.0 15.0)) (< v 0))
+    (let ((not (mapcar 'ec-s8-to-u8 (mapcar 'lognot (ec-u16 (abs v))))))
+      (cond
+       ((< (elt not 0) 255) (incf (elt not 0)))
+       ((and (setf (elt not 0) 0) (< (elt not 1) 255)) (incf (elt not 1)))
+       (t (setf (elt not 1) 0)))
+      not))
+   (t (error "invalid value"))))
 
 (defun ec-str (str max)
   (list
@@ -345,19 +411,19 @@
         (ec-u32 #xc0000080)                                       ; Characteristics: uninit. data, read, write
         ))
 
-       ;; Write .text segment.
+      ;; Write .text segment.
       (ec-seek text-offset)
       (mapcar 'insert prog-code)
 
-       ;; Write .rdata segment.
+      ;; Write .rdata segment.
       (ec-seek rdata-offset)
       (mapcar 'insert prog-data)
 
-       ;; Write .idata segment.
+      ;; Write .idata segment.
       (ec-seek idata-offset)
 
-       ;; Import Address Table (IAT):
-       ;; (Same as the Import Lookup Table)
+      ;; Import Address Table (IAT):
+      ;; (Same as the Import Lookup Table)
       (mapcar
        'insert
        (append
@@ -417,9 +483,9 @@
   (when (not pad)
     (setq pad 32))
   (let ((tab ["0000" "0001" "0010" "0011" "0100" "0101" "0110" "0111"
-	      "1000" "1001" "1010" "1011" "1100" "1101" "1110" "1111"])
-	(res "")
-	(i 0))
+              "1000" "1001" "1010" "1011" "1100" "1101" "1110" "1111"])
+        (res "")
+        (i 0))
     (while (< i pad)
       (setq res (concat (aref tab (logand n #xf))
                         (if (and (not (zerop i)) (zerop (mod i 8))) " " "")
@@ -430,18 +496,18 @@
 
 (defun ec-nasm (src)
   (let* ((bin-file "/tmp/nasm-src-tmp")
-	 (src-file (concat bin-file ".asm")))
+         (src-file (concat bin-file ".asm")))
     (with-temp-file src-file
       (insert src))
     (shell-command-to-string (concat "rm -f " bin-file " && nasm -o " bin-file " " src-file))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (let ((coding-system-for-read 'raw-text-unix))
-	(insert-file-contents bin-file))
+        (insert-file-contents bin-file))
       ;; convert to buffer string to list. this seems needlessly complex but oh well...
       (let (r)
-	(mapc (lambda (c) (push c r)) (buffer-string))
-	(nreverse r)))))
+        (mapc (lambda (c) (push c r)) (buffer-string))
+        (nreverse r)))))
 
 (defun ec-ndisasm (bin)
   (let* ((bin-file "/tmp/nasm-src-tmp"))
@@ -468,7 +534,7 @@
    #x6a #xf5                      ;   pushl  $-11
    #xff #x15 #x00 #x30 #x40 #x00  ;   call   *iat_slot0
    #x89 #xc7                      ;   movl   %eax,%edi
-                                  ; read:
+                                        ; read:
    #x6a #x00                      ;   pushl  $0
    #x89 #xe0                      ;   movl   %esp,%eax
    #x6a #x00                      ;   pushl  $0
@@ -482,7 +548,7 @@
    #x7e #x26                      ;   jle    end
    #xb9 #x00 #x40 #x40 #x00       ;   movl   $buffer,%ecx
    #x89 #xc2                      ;   movl   %eax,%edx
-                                  ; rot13:
+                                        ; rot13:
    #x0f #xb6 #x19                 ;   movzbl (%ecx),%ebx
    #x8a #x9b #x00 #x20 #x40 #x00  ;   movb   rot13_table(%ebx),%bl
    #x88 #x19                      ;   movb   %bl,(%ecx)
@@ -497,7 +563,7 @@
    #x57                           ;   pushl  %edi
    #xff #x15 #x08 #x30 #x40 #x00  ;   call   *iat_slot2
    #xeb #xbd                      ;   jmp    read
-                                  ; end:
+                                        ; end:
    #x6a #x00                      ;   pushl  $0
    #xff #x15 #x0c #x30 #x40 #x00  ;   call   *iat_slot3
    ))
