@@ -31,6 +31,10 @@
     (dolist (inst program output)
       (let ((res
              (pcase inst
+               ;; int INT8
+               (`(int ,(and num (pred integerp)))
+                (list #xcd (ec-u8 num)))
+
                ;; label:
                ((and sym (pred ec-label-p))
                 (puthash (ec-strip-label sym) offset label-map) nil)
@@ -197,6 +201,93 @@
     (error "buffer already bigger (pmax=%S, offset=%S)" (point-max) offset)
     (goto-char offset)))
 
+(defun ec-write-elf (prog-data prog-code file)
+  (let* ((text-addr #x8048000)
+         (rdata-addr #x8049000)
+         (bss-addr #x804a000)
+         (text-size (length prog-code))
+         (rdata-size (length prog-data))
+         (bss-size 4096)
+         (eh-size 52) ; ELF header size
+         (ph-size 32) ; program header size
+         (page-size 4096)
+         (text-offset (ec-align-to (+ eh-size (* 3 ph-size)) page-size))
+         (rdata-offset (ec-align-to (+ text-offset text-size) page-size))
+         )
+
+    (cl-assert (>= (- rdata-addr text-addr) text-size))
+    (cl-assert (>= (- bss-addr rdata-addr) rdata-size))
+
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+
+      ;; mz header
+      (mapc
+       'insert
+       (append
+        '(#x7f)
+        '("ELF")    ; magic
+        (ec-u8 1)       ; EI_CLASS:     32-bit
+        (ec-u8 1)       ; EI_DATA:      Little-endian
+        (ec-u8 1)       ; EI_VERSION:   Current
+        (ec-u8 0)       ; EI_OSABI:     No extensions
+        (ec-u8 0)       ; EI_ABIVERSION
+        (list (make-string 7 0)) ; 7 bytes of padding
+        (ec-u16 2)         ; e_type:     ET_EXEC
+        (ec-u16 3)         ; e_machine:  EM_386
+        (ec-u32 1)         ; e_version:  EV_CURRENT
+        (ec-u32 text-addr) ; e_entry
+        (ec-u32 eh-size)    ; e_phoff
+        (ec-u32 0)         ; e_shoff
+        (ec-u32 0)         ; e_flags
+        (ec-u16 eh-size)    ; e_ehsize
+        (ec-u16 ph-size)    ; e_phentsize
+        (ec-u16 3)         ; e_phnum
+        (ec-u16 40)        ; e_shentsize
+        (ec-u16 0)         ; e_shnum
+        (ec-u16 0)         ; e_shstrndx
+
+
+        ;; Program header 1 (TEXT).
+        (ec-u32 1)           ; p_type: PT_LOAD
+        (ec-u32 text-offset) ; p_offset
+        (ec-u32 text-addr)   ; p_vaddr
+        (ec-u32 0)           ; p_paddr
+        (ec-u32 text-size)   ; p_filesz
+        (ec-u32 text-size)   ; p_memsz
+        (ec-u32 (logior #x4 #x1))   ; p_flags: PF_R | PF_X
+        (ec-u32 page-size)   ; p_align
+
+        ;; Program header 2 (RDATA).
+        (ec-u32 1)            ; p_type: PT_LOAD
+        (ec-u32 rdata-offset) ; p_offset
+        (ec-u32 rdata-addr)   ; p_vaddr
+        (ec-u32 0)            ; p_paddr
+        (ec-u32 rdata-size)   ; p_filesz
+        (ec-u32 rdata-size)   ; p_memsz
+        (ec-u32 #x4)          ; p_flags: PF_R
+        (ec-u32 page-size)    ; p_align
+
+        ;; Program header 3 (BSS).
+        (ec-u32 1)         ; p_type: PT_LOAD
+        (ec-u32 0)         ; p_offset
+        (ec-u32 bss-addr)  ; p_vaddr
+        (ec-u32 0)         ; p_paddr
+        (ec-u32 0)         ; p_filesz
+        (ec-u32 bss-size)  ; p_memsz
+        (ec-u32 (logior #x4 #x2)) ; p_flags: PF_R | PF_W
+        (ec-u32 page-size) ; p_align
+        ))
+
+      ;; Write .text segment.
+      (ec-seek text-offset)
+      (mapc 'insert prog-code)
+
+      ;; Write .rdata segment.
+      (ec-seek rdata-offset)
+      (mapc 'insert prog-data)
+      (let ((coding-system-for-write 'raw-text-unix))
+        (write-file file)))))
 
 (defun ec-write-pe (prog-data prog-code file)
   (let* ((dos-hdr-size #x40)
@@ -255,7 +346,7 @@
       (set-buffer-multibyte nil)
 
       ;; mz header
-      (mapcar
+      (mapc
        'insert
        (append
         '("MZ")                                  ; magic
@@ -285,7 +376,7 @@
       (ec-seek pe-offset)
 
       ;; pe signature
-      (mapcar
+      (mapc
        'insert
        (append
         '("PE")
@@ -293,7 +384,7 @@
         (ec-u8 0)))
 
       ;; coff header
-      (mapcar
+      (mapc
        'insert
        (append
         (ec-u16 #x14c)       ; Machine = IMAGE_FILE_MACHINE_I386
@@ -305,7 +396,7 @@
         (ec-u16 #x103)       ; Characteristics = no reloc, exec, 32b
         ))
 
-      (mapcar
+      (mapc
        'insert
        (append
         ;; Optional header, part 1: standard fields
@@ -413,18 +504,18 @@
 
       ;; Write .text segment.
       (ec-seek text-offset)
-      (mapcar 'insert prog-code)
+      (mapc 'insert prog-code)
 
       ;; Write .rdata segment.
       (ec-seek rdata-offset)
-      (mapcar 'insert prog-data)
+      (mapc 'insert prog-data)
 
       ;; Write .idata segment.
       (ec-seek idata-offset)
 
       ;; Import Address Table (IAT):
       ;; (Same as the Import Lookup Table)
-      (mapcar
+      (mapc
        'insert
        (append
         (ec-u32 (+ name-table-rva (* 0 name-table-entry-size)))
@@ -477,7 +568,8 @@
       (write-file file))))
 
 (defun ec-main ()
-  (ec-write-pe ec-prog-data ec-prog-code "rot13.exe"))
+  (ec-write-pe ec-prog-data ec-prog-code-pe "rot13.exe")
+  (ec-write-elf ec-prog-data ec-prog-code-elf "rot13"))
 
 (defun ec-to-bin (n &optional pad)
   (when (not pad)
@@ -526,7 +618,7 @@
         " " "D" "O" "S" " " "w"
         "o" "r" "l" "d" "!" "$"))
 
-(defvar ec-prog-code
+(defvar ec-prog-code-pe
   (list
    #x6a #xf6                      ;   pushl  $-10
    #xff #x15 #x00 #x30 #x40 #x00  ;   call   *iat_slot0
@@ -566,6 +658,35 @@
                                         ; end:
    #x6a #x00                      ;   pushl  $0
    #xff #x15 #x0c #x30 #x40 #x00  ;   call   *iat_slot3
+   ))
+
+(defvar ec-prog-code-elf
+  (list
+                                        ; read:
+   #xb8 #x03 #x00 #x00 #x00             ;   movl   $3,%eax
+   #x31 #xdb                            ;   xorl   %ebx,%ebx
+   #xb9 #x00 #xa0 #x04 #x08             ;   movl   $buffer,%ecx
+   #xba #x00 #x10 #x00 #x00             ;   movl   $4096,%edx
+   #xcd #x80                            ;   int    $0x80
+   #x85 #xc0                            ;   testl  %eax,%eax
+   #x7e #x21                            ;   jle    end
+   #x89 #xc2                            ;   movl   %eax,%edx
+                                        ; rot13:
+   #x0f #xb6 #x19                       ;   movzbl (%ecx),%ebx
+   #x8a #x9b #x00 #x90 #x04 #x08        ;   movb   rot13_table(%ebx),%bl
+   #x88 #x19                            ;   movb   %bl,(%ecx)
+   #x41                                 ;   incl   %ecx
+   #x48                                 ;   decl   %eax
+   #x75 #xf1                            ;   jnz    rot13
+   #xb8 #x04 #x00 #x00 #x00             ;   movl   $4,%eax
+   #xbb #x01 #x00 #x00 #x00             ;   movl   $1,%ebx
+   #x29 #xd1                            ;   subl   %edx,%ecx
+   #xcd #x80                            ;   int    $0x80
+   #xeb #xc8                            ;   jmp    read
+                                        ; end:
+   #xb8 #x01 #x00 #x00 #x00             ;   movl   $1,%eax
+   #x31 #xdb                            ;   xorl   %ebx,%ebx
+   #xcd #x80                            ;   int    $0x80
    ))
 
 (defvar ec-prog-data
