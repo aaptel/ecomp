@@ -1,7 +1,5 @@
-;; tiny 32bit PE assembler (windows) -- aurelien.aptel@gmail.com
+;; tiny 32bit x86 assembler -- aurelien.aptel@gmail.com
 ;; -*- indent-tabs-mode: nil -*-
-
-;; TODO: 2-pass encode (e.g. label after jmp)
 
 (require 'pcase)
 (require 'cl)
@@ -21,12 +19,16 @@
 (defun ec-label-p (sym)
   (and (symbolp sym) (string-match-p (rx ":" eos) (symbol-name sym))))
 
-(defun ec-existing-label-p (map sym)
-  (gethash sym map))
+(defun ec-existing-label-p (has-labels map sym)
+  (if has-labels (gethash sym map) t))
 
 (defun ec-encode (program)
+  (let ((label-map (make-hash-table)))
+    (ec-encode-1 program nil label-map)
+    (ec-encode-1 program t label-map)))
+
+(defun ec-encode-1 (program has-labels label-map)
   (let ((offset 0)
-        (label-map (make-hash-table))
         (output nil))
     (dolist (inst program output)
       (let ((res
@@ -40,8 +42,8 @@
                 (puthash (ec-strip-label sym) offset label-map) nil)
 
                ;; jmp label
-               (`(jmp ,(and label (pred (ec-existing-label-p label-map))))
-                `(#xe9 ,@(ec-s16 (- (gethash label label-map) (+ offset 3)))))
+               (`(jmp ,(and label (pred (ec-existing-label-p has-labels label-map))))
+                `(#xe9 ,@(ec-s16 (if has-labels (- (gethash label label-map) (+ offset 3)) 0))))
 
                ;; jmp REG
                (`(jmp ,(and dst (pred ec-register-p)))
